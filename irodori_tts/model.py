@@ -8,6 +8,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
+from .attention import (
+    ContextAttentionPlan,
+    build_context_attention_plan,
+    context_attention,
+    masked_sdpa,
+    prefix_key_mask_attention,
+)
 from .config import ModelConfig
 from .speaker_inversion import SPEAKER_INVERSION_UNCOND_MODES, SpeakerInversionEmbedding
 
@@ -186,17 +193,7 @@ class SelfAttention(nn.Module):
         q = apply_rotary_emb(q, freqs_cis[:seq_len])
         k = apply_rotary_emb(k, freqs_cis[:seq_len])
 
-        attn_mask = None
-        if key_mask is not None:
-            attn_mask = key_mask[:, None, None, :]
-
-        y = F.scaled_dot_product_attention(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            attn_mask=attn_mask,
-            is_causal=False,
-        ).transpose(1, 2)
+        y = prefix_key_mask_attention(q, k, v, key_mask)
         y = y.reshape(bsz, seq_len, self.dim)
         y = y * torch.sigmoid(gate)
         return self.wo(y)
@@ -309,6 +306,37 @@ class JointAttention(nn.Module):
         projected.extend([k_caption, v_caption])
         return tuple(projected)
 
+    @staticmethod
+    def build_context_masks(
+        *,
+        batch: int,
+        query_len: int,
+        device: torch.device,
+        self_mask: torch.Tensor | None,
+        text_len: int,
+        text_mask: torch.Tensor | None,
+        speaker_len: int | None = None,
+        speaker_mask: torch.Tensor | None = None,
+        caption_len: int | None = None,
+        caption_mask: torch.Tensor | None = None,
+    ) -> list[torch.Tensor]:
+        """
+        Normalize the per-segment key masks in kv concatenation order
+        (self, text[, speaker][, caption]). Missing masks mean fully valid.
+        """
+
+        def _default(mask: torch.Tensor | None, length: int) -> torch.Tensor:
+            if mask is not None:
+                return mask
+            return torch.ones((batch, length), dtype=torch.bool, device=device)
+
+        masks = [_default(self_mask, query_len), _default(text_mask, text_len)]
+        if speaker_len is not None:
+            masks.append(_default(speaker_mask, speaker_len))
+        if caption_len is not None:
+            masks.append(_default(caption_mask, caption_len))
+        return masks
+
     def forward(
         self,
         x: torch.Tensor,
@@ -321,6 +349,7 @@ class JointAttention(nn.Module):
         freqs_cis: torch.Tensor,
         self_mask: torch.Tensor | None = None,
         context_kv: tuple[torch.Tensor, ...] | None = None,
+        context_plan: ContextAttentionPlan | None = None,
     ) -> torch.Tensor:
         bsz, seq_len, _ = x.shape
         q = self.wq(x).reshape(bsz, seq_len, self.heads, self.head_dim)
@@ -354,62 +383,43 @@ class JointAttention(nn.Module):
         q = self._apply_rotary_half(q, freqs_cis[:seq_len])
         k_self = self._apply_rotary_half(k_self, freqs_cis[:seq_len])
 
-        if self_mask is None:
-            self_mask = torch.ones((bsz, seq_len), dtype=torch.bool, device=x.device)
-        if text_mask is None:
-            text_mask = torch.ones(
-                (bsz, text_context.shape[1]),
-                dtype=torch.bool,
-                device=x.device,
-            )
         context_k = [k_self, k_text]
         context_v = [v_self, v_text]
-        context_masks = [self_mask, text_mask]
         if self.has_speaker_condition:
-            if speaker_context is None or k_speaker is None or v_speaker is None:
+            if k_speaker is None or v_speaker is None:
                 raise ValueError(
                     "speaker_context is required when speaker conditioning is enabled."
                 )
-            if speaker_mask is None:
-                speaker_mask = torch.ones(
-                    (bsz, speaker_context.shape[1]),
-                    dtype=torch.bool,
-                    device=x.device,
-                )
             context_k.append(k_speaker)
             context_v.append(v_speaker)
-            context_masks.append(speaker_mask)
         if self.has_caption_condition:
-            if caption_context is None:
-                raise ValueError(
-                    "caption_context is required when caption conditioning is enabled."
-                )
-            if caption_mask is None:
-                caption_mask = torch.ones(
-                    (bsz, caption_context.shape[1]),
-                    dtype=torch.bool,
-                    device=x.device,
-                )
             if k_caption is None or v_caption is None:
                 raise RuntimeError(
                     "Caption projections are missing despite enabled caption conditioning."
                 )
             context_k.append(k_caption)
             context_v.append(v_caption)
-            context_masks.append(caption_mask)
 
         k = torch.cat(context_k, dim=1)
         v = torch.cat(context_v, dim=1)
-        attn_mask = torch.cat(context_masks, dim=1)
-        attn_mask = attn_mask[:, None, None, :]
-
-        y = F.scaled_dot_product_attention(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            attn_mask=attn_mask,
-            is_causal=False,
-        ).transpose(1, 2)
+        if context_plan is None:
+            context_plan = build_context_attention_plan(
+                self.build_context_masks(
+                    batch=bsz,
+                    query_len=seq_len,
+                    device=x.device,
+                    self_mask=self_mask,
+                    text_len=k_text.shape[1],
+                    text_mask=text_mask,
+                    speaker_len=k_speaker.shape[1] if k_speaker is not None else None,
+                    speaker_mask=speaker_mask if self.has_speaker_condition else None,
+                    caption_len=k_caption.shape[1] if k_caption is not None else None,
+                    caption_mask=caption_mask if self.has_caption_condition else None,
+                ),
+                query_len=seq_len,
+                attention_dtype=q.dtype,
+            )
+        y = context_attention(q, k, v, context_plan)
         y = y.reshape(bsz, seq_len, self.dim)
         y = y * torch.sigmoid(self.gate(x))
         return self.wo(y)
@@ -474,14 +484,8 @@ class AttentionPooling(nn.Module):
         q = self.wq(self.q_norm(q)).reshape(bsz, 1, self.heads, self.head_dim)
         k = self.wk(self.k_norm(x)).reshape(bsz, seq_len, self.heads, self.head_dim)
         v = self.wv(x).reshape(bsz, seq_len, self.heads, self.head_dim)
-        y = F.scaled_dot_product_attention(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            attn_mask=mask[:, None, None, :],
-            is_causal=False,
-        )
-        y = y.transpose(1, 2).reshape(bsz, 1, self.dim)
+        y = masked_sdpa(q, k, v, mask[:, None, None, :])
+        y = y.reshape(bsz, 1, self.dim)
         return self.wo(y).squeeze(1)
 
 
@@ -530,14 +534,8 @@ class CrossAttentionPooling(nn.Module):
         q = self.wq(self.q_norm(q)).reshape(bsz, 1, self.heads, self.head_dim)
         k = self.wk(self.k_norm(context)).reshape(bsz, seq_len, self.heads, self.head_dim)
         v = self.wv(context).reshape(bsz, seq_len, self.heads, self.head_dim)
-        y = F.scaled_dot_product_attention(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            attn_mask=context_mask[:, None, None, :],
-            is_causal=False,
-        )
-        y = y.transpose(1, 2).reshape(bsz, 1, self.output_dim)
+        y = masked_sdpa(q, k, v, context_mask[:, None, None, :])
+        y = y.reshape(bsz, 1, self.output_dim)
         return self.wo(y).squeeze(1)
 
 
@@ -672,6 +670,216 @@ class TextEncoder(nn.Module):
         return x * mask_f
 
 
+class PretrainedTextBackbone(nn.Module):
+    """Hugging Face backbone shared by text and caption conditioning."""
+
+    def __init__(
+        self,
+        repo_id: str,
+        *,
+        revision: str | None = None,
+        config_dict: dict[str, object] | None = None,
+        load_pretrained_weights: bool = True,
+    ):
+        super().__init__()
+        try:
+            from transformers import AutoConfig, AutoModel
+            from transformers.initialization import no_init_weights
+        except ImportError as exc:
+            raise RuntimeError(
+                "transformers is required when text_encoder_type='pretrained'."
+            ) from exc
+
+        if config_dict is None:
+            config = AutoConfig.from_pretrained(
+                repo_id,
+                trust_remote_code=False,
+                revision=revision,
+            )
+        else:
+            raw_config = dict(config_dict)
+            model_type = raw_config.pop("model_type", None)
+            if not isinstance(model_type, str) or not model_type:
+                raise ValueError("Embedded pretrained text encoder config has no model_type.")
+            config = AutoConfig.for_model(model_type, **raw_config)
+        if str(getattr(config, "model_type", "")).lower() == "t5gemma2":
+            # Loading AutoModel would materialize the decoder and vision tower before
+            # discarding them. Load only the bidirectional text encoder weights.
+            try:
+                from transformers.models.t5gemma2.modeling_t5gemma2 import (
+                    T5Gemma2TextEncoder,
+                )
+            except ImportError as exc:
+                raise RuntimeError(
+                    "The installed transformers version does not expose T5Gemma2TextEncoder."
+                ) from exc
+            if load_pretrained_weights:
+                backbone = T5Gemma2TextEncoder.from_pretrained(
+                    repo_id,
+                    config=config.encoder.text_config,
+                    eoi_token_index=config.eoi_token_index,
+                    trust_remote_code=False,
+                    low_cpu_mem_usage=True,
+                    revision=revision,
+                    key_mapping={r"^model\.encoder\.(.*)": r"\1"},
+                )
+            else:
+                with no_init_weights():
+                    backbone = T5Gemma2TextEncoder(
+                        config.encoder.text_config,
+                        eoi_token_index=config.eoi_token_index,
+                    )
+        else:
+            if load_pretrained_weights:
+                loaded_model = AutoModel.from_pretrained(
+                    repo_id,
+                    config=config,
+                    trust_remote_code=False,
+                    low_cpu_mem_usage=True,
+                    revision=revision,
+                )
+            else:
+                with no_init_weights():
+                    loaded_model = AutoModel.from_config(
+                        config,
+                        trust_remote_code=False,
+                    )
+            if bool(getattr(config, "is_encoder_decoder", False)):
+                get_encoder = getattr(loaded_model, "get_encoder", None)
+                if get_encoder is None:
+                    raise ValueError(
+                        f"Encoder-decoder model does not expose get_encoder(): {repo_id}"
+                    )
+                encoder = get_encoder()
+                backbone = getattr(encoder, "text_model", encoder)
+            else:
+                backbone = loaded_model
+
+        hidden_size = _pretrained_hidden_size(backbone.config)
+        # Keep the backbone weights in fp32. Hugging Face checkpoints load in
+        # bf16 by default, which would make optimizer states/updates run in pure
+        # bf16 (no fp32 master weights) and round away sub-ulp updates; autocast
+        # still executes the forward pass in bf16.
+        backbone = backbone.float()
+        # Register only the selected backbone. In the encoder-decoder case this
+        # drops the decoder immediately after loading.
+        self.backbone = backbone
+        self.hidden_size = hidden_size
+        self.repo_id = str(repo_id)
+        self.revision = revision
+        self.config_dict = config.to_dict()
+        for parameter in self.backbone.parameters():
+            parameter.requires_grad_(True)
+
+    def forward(self, input_ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        outputs = self.backbone(
+            input_ids=input_ids,
+            attention_mask=mask,
+            return_dict=True,
+        )
+        state = outputs.last_hidden_state
+        return state * mask.unsqueeze(-1).to(dtype=state.dtype)
+
+    def set_gradient_checkpointing(self, enabled: bool) -> None:
+        method_name = (
+            "gradient_checkpointing_enable" if enabled else "gradient_checkpointing_disable"
+        )
+        method = getattr(self.backbone, method_name, None)
+        if callable(method):
+            method()
+
+
+def _pretrained_hidden_size(config: object) -> int:
+    candidates = (
+        config,
+        getattr(config, "text_config", None),
+        getattr(config, "encoder", None),
+        getattr(getattr(config, "encoder", None), "text_config", None),
+    )
+    for candidate in candidates:
+        hidden_size = getattr(candidate, "hidden_size", None)
+        if hidden_size is not None:
+            return int(hidden_size)
+    raise ValueError(f"Could not determine pretrained encoder hidden size from {config!r}.")
+
+
+class PretrainedConditionProjector(nn.Module):
+    """Trainable projection from a shared pretrained backbone into a condition space."""
+
+    def __init__(
+        self,
+        backbone_dim: int,
+        output_dim: int,
+        *,
+        projector_type: str = "linear",
+        hidden_ratio: float = 2.0,
+        dropout: float = 0.0,
+        norm_eps: float = 1e-5,
+    ):
+        super().__init__()
+        projector_type = str(projector_type).strip().lower()
+        if projector_type not in {"linear", "residual_mlp"}:
+            raise ValueError(
+                "pretrained projector type must be 'linear' or 'residual_mlp', "
+                f"got {projector_type!r}."
+            )
+        if hidden_ratio <= 0:
+            raise ValueError(f"projector hidden_ratio must be > 0, got {hidden_ratio}.")
+        if not 0.0 <= dropout <= 1.0:
+            raise ValueError(f"projector dropout must be in [0, 1], got {dropout}.")
+
+        self.projector_type = projector_type
+        self.projector = nn.Linear(backbone_dim, output_dim, bias=True)
+        if backbone_dim == output_dim:
+            nn.init.eye_(self.projector.weight)
+        else:
+            nn.init.xavier_uniform_(self.projector.weight)
+        if self.projector.bias is not None:
+            nn.init.zeros_(self.projector.bias)
+
+        self.residual_norm = None
+        self.residual_up = None
+        self.residual_down = None
+        self.residual_dropout = None
+        if projector_type == "residual_mlp":
+            hidden_dim = max(1, int(round(output_dim * float(hidden_ratio))))
+            self.residual_norm = RMSNorm(backbone_dim, eps=norm_eps)
+            self.residual_up = nn.Linear(backbone_dim, hidden_dim, bias=True)
+            self.residual_down = nn.Linear(hidden_dim, output_dim, bias=True)
+            self.residual_dropout = nn.Dropout(float(dropout))
+            # Start exactly at the base Linear mapping. The residual branch
+            # gradually comes online during projector-only warmup.
+            nn.init.zeros_(self.residual_down.weight)
+            nn.init.zeros_(self.residual_down.bias)
+
+    def forward(
+        self,
+        backbone: PretrainedTextBackbone,
+        input_ids: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        state = backbone(input_ids, mask)
+        if (
+            not torch.is_autocast_enabled(state.device.type)
+            and state.dtype != self.projector.weight.dtype
+        ):
+            state = state.to(dtype=self.projector.weight.dtype)
+        projected = self.projector(state)
+        if self.projector_type == "residual_mlp":
+            if (
+                self.residual_norm is None
+                or self.residual_up is None
+                or self.residual_down is None
+                or self.residual_dropout is None
+            ):
+                raise RuntimeError("Residual pretrained projector modules are missing.")
+            residual = self.residual_norm(state)
+            residual = F.silu(self.residual_up(residual))
+            residual = self.residual_dropout(residual)
+            projected = projected + self.residual_down(residual)
+        return projected * mask.unsqueeze(-1).to(dtype=projected.dtype)
+
+
 class ReferenceLatentEncoder(nn.Module):
     """
     Encoder for reference latents used as speaker/style conditioning.
@@ -754,6 +962,7 @@ class DiffusionBlock(nn.Module):
         freqs_cis: torch.Tensor,
         self_mask: torch.Tensor | None = None,
         context_kv: tuple[torch.Tensor, ...] | None = None,
+        context_plan: ContextAttentionPlan | None = None,
     ) -> torch.Tensor:
         h, attention_gate = self.attention_adaln(x, cond_embed)
         x = x + self.dropout(
@@ -769,6 +978,7 @@ class DiffusionBlock(nn.Module):
                 freqs_cis=freqs_cis,
                 self_mask=self_mask,
                 context_kv=context_kv,
+                context_plan=context_plan,
             )
         )
 
@@ -1250,30 +1460,70 @@ class TextToLatentRFDiT(nn.Module):
     Output v_pred shape: same as input.
     """
 
-    def __init__(self, cfg: ModelConfig):
+    def __init__(
+        self,
+        cfg: ModelConfig,
+        *,
+        pretrained_backbone_config: dict[str, object] | None = None,
+        load_pretrained_backbone_weights: bool = True,
+    ):
         super().__init__()
         self.cfg = cfg
-        self.text_encoder = TextEncoder(
-            vocab_size=cfg.text_vocab_size,
-            dim=cfg.text_dim,
-            layers=cfg.text_layers,
-            heads=cfg.text_heads,
-            mlp_ratio=cfg.text_mlp_ratio_resolved,
-            norm_eps=cfg.norm_eps,
-            dropout=cfg.dropout,
-        )
-        self.caption_encoder = None
-        self.caption_norm = None
-        if cfg.use_caption_condition:
-            self.caption_encoder = TextEncoder(
-                vocab_size=cfg.caption_vocab_size_resolved,
-                dim=cfg.caption_dim_resolved,
-                layers=cfg.caption_layers_resolved,
-                heads=cfg.caption_heads_resolved,
-                mlp_ratio=cfg.caption_mlp_ratio_resolved,
+        self.pretrained_text_backbone = None
+        if cfg.use_pretrained_text_encoder:
+            self.pretrained_text_backbone = PretrainedTextBackbone(
+                cfg.text_tokenizer_repo,
+                revision=cfg.text_encoder_revision,
+                config_dict=pretrained_backbone_config,
+                load_pretrained_weights=load_pretrained_backbone_weights,
+            )
+            self.text_encoder = PretrainedConditionProjector(
+                self.pretrained_text_backbone.hidden_size,
+                cfg.text_dim,
+                projector_type=cfg.pretrained_projector_type,
+                hidden_ratio=cfg.pretrained_projector_hidden_ratio,
+                dropout=cfg.pretrained_projector_dropout,
+                norm_eps=cfg.norm_eps,
+            )
+        else:
+            self.text_encoder = TextEncoder(
+                vocab_size=cfg.text_vocab_size,
+                dim=cfg.text_dim,
+                layers=cfg.text_layers,
+                heads=cfg.text_heads,
+                mlp_ratio=cfg.text_mlp_ratio_resolved,
                 norm_eps=cfg.norm_eps,
                 dropout=cfg.dropout,
             )
+        self.caption_encoder = None
+        self.caption_norm = None
+        if cfg.use_caption_condition:
+            if cfg.use_pretrained_text_encoder:
+                if cfg.caption_tokenizer_repo_resolved != cfg.text_tokenizer_repo:
+                    raise ValueError(
+                        "A shared pretrained text/caption encoder requires identical tokenizer "
+                        "repositories: "
+                        f"text={cfg.text_tokenizer_repo!r}, "
+                        f"caption={cfg.caption_tokenizer_repo_resolved!r}."
+                    )
+                self.caption_encoder = PretrainedConditionProjector(
+                    self.pretrained_text_backbone.hidden_size,
+                    cfg.caption_dim_resolved,
+                    projector_type=cfg.pretrained_projector_type,
+                    hidden_ratio=cfg.pretrained_projector_hidden_ratio,
+                    dropout=cfg.pretrained_projector_dropout,
+                    norm_eps=cfg.norm_eps,
+                )
+            else:
+                self.caption_encoder = TextEncoder(
+                    vocab_size=cfg.caption_vocab_size_resolved,
+                    dim=cfg.caption_dim_resolved,
+                    layers=cfg.caption_layers_resolved,
+                    heads=cfg.caption_heads_resolved,
+                    mlp_ratio=cfg.caption_mlp_ratio_resolved,
+                    norm_eps=cfg.norm_eps,
+                    dropout=cfg.dropout,
+                )
             self.caption_norm = RMSNorm(cfg.caption_dim_resolved, eps=cfg.norm_eps)
         self.speaker_encoder = None
         if cfg.use_speaker_condition_resolved:
@@ -1314,10 +1564,21 @@ class TextToLatentRFDiT(nn.Module):
             nn.SiLU(),
             nn.Linear(cfg.model_dim, cfg.model_dim * 3, bias=False),
         )
+        self.delta_cond_module = None
+        flow_parameterization = str(cfg.flow_parameterization).strip().lower()
+        if flow_parameterization not in {"rf_velocity", "meanflow"}:
+            raise ValueError(
+                "flow_parameterization must be 'rf_velocity' or 'meanflow', "
+                f"got {cfg.flow_parameterization!r}."
+            )
+        self.cfg.flow_parameterization = flow_parameterization
+        if flow_parameterization == "meanflow":
+            self._add_meanflow_delta_condition()
 
         self.in_proj = nn.Linear(cfg.patched_latent_dim, cfg.model_dim)
         self.blocks = nn.ModuleList(DiffusionBlock(cfg) for _ in range(cfg.num_layers))
         self.gradient_checkpointing = False
+        self.gradient_checkpointing_store_every = 0
         self.out_norm = RMSNorm(cfg.model_dim, eps=cfg.norm_eps)
         self.out_proj = nn.Linear(cfg.model_dim, cfg.patched_latent_dim)
         # Echo/JAX training initializes decoder out projection to zero for stable early training.
@@ -1332,8 +1593,42 @@ class TextToLatentRFDiT(nn.Module):
             "_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False
         )
 
-    def set_gradient_checkpointing(self, enabled: bool) -> None:
+    def _add_meanflow_delta_condition(self) -> None:
+        if self.delta_cond_module is not None:
+            return
+        cfg = self.cfg
+        module = nn.Sequential(
+            nn.Linear(cfg.timestep_embed_dim, cfg.model_dim, bias=False),
+            nn.SiLU(),
+            nn.Linear(cfg.model_dim, cfg.model_dim, bias=False),
+            nn.SiLU(),
+            nn.Linear(cfg.model_dim, cfg.model_dim * 3, bias=False),
+        )
+        nn.init.zeros_(module[-1].weight)
+        self.delta_cond_module = module
+
+    def enable_meanflow_parameterization(self) -> None:
+        """Convert a loaded RF model into a zero-initialized MeanFlow student."""
+        if self.delta_cond_module is None:
+            reference = next(self.cond_module.parameters())
+            self._add_meanflow_delta_condition()
+            self.delta_cond_module.to(device=reference.device, dtype=reference.dtype)
+        self.cfg.flow_parameterization = "meanflow"
+
+    def set_gradient_checkpointing(self, enabled: bool, store_every: int = 0) -> None:
+        """
+        Enable/disable activation checkpointing on the diffusion blocks.
+
+        ``store_every`` keeps activations (skips checkpointing) for one out of
+        every N blocks, trading memory for skipping their forward
+        recomputation in backward. 0 checkpoints every block.
+        """
+        if int(store_every) < 0:
+            raise ValueError(f"gradient checkpointing store_every must be >= 0, got {store_every}")
         self.gradient_checkpointing = bool(enabled)
+        self.gradient_checkpointing_store_every = int(store_every)
+        if self.pretrained_text_backbone is not None:
+            self.pretrained_text_backbone.set_gradient_checkpointing(enabled)
 
     def enable_speaker_inversion(
         self,
@@ -1527,7 +1822,10 @@ class TextToLatentRFDiT(nn.Module):
                 caption_mask = caption_mask.clone()
                 caption_mask[caption_condition_dropout] = False
 
-        text_state = self.text_encoder(text_input_ids, text_mask)
+        if self.pretrained_text_backbone is None:
+            text_state = self.text_encoder(text_input_ids, text_mask)
+        else:
+            text_state = self.text_encoder(self.pretrained_text_backbone, text_input_ids, text_mask)
         text_state = self.text_norm(text_state)
         ref_state = None
         if self.cfg.use_speaker_condition_resolved:
@@ -1567,7 +1865,12 @@ class TextToLatentRFDiT(nn.Module):
             )
         caption_state = None
         if self.cfg.use_caption_condition:
-            caption_state = self.caption_encoder(caption_input_ids, caption_mask)
+            if self.pretrained_text_backbone is None:
+                caption_state = self.caption_encoder(caption_input_ids, caption_mask)
+            else:
+                caption_state = self.caption_encoder(
+                    self.pretrained_text_backbone, caption_input_ids, caption_mask
+                )
             caption_state = self.caption_norm(caption_state)
         return text_state, text_mask, ref_state, ref_mask, caption_state, caption_mask
 
@@ -1583,17 +1886,63 @@ class TextToLatentRFDiT(nn.Module):
         caption_mask: torch.Tensor | None = None,
         latent_mask: torch.Tensor | None = None,
         context_kv_cache: list[tuple[torch.Tensor, ...]] | None = None,
+        delta_t: torch.Tensor | None = None,
     ) -> torch.Tensor:
         t_embed = get_timestep_embedding(t, self.cfg.timestep_embed_dim).to(dtype=x_t.dtype)
         cond_embed = self.cond_module(t_embed)
+        if self.delta_cond_module is not None:
+            if delta_t is None:
+                raise ValueError("delta_t is required for a MeanFlow forward pass.")
+            if delta_t.shape != t.shape:
+                raise ValueError(
+                    f"delta_t must match t shape {tuple(t.shape)}, got {tuple(delta_t.shape)}"
+                )
+            delta_embed = get_timestep_embedding(delta_t, self.cfg.timestep_embed_dim).to(
+                dtype=x_t.dtype
+            )
+            cond_embed = cond_embed + self.delta_cond_module(delta_embed)
+        elif delta_t is not None:
+            raise ValueError("delta_t was provided to an RF velocity model.")
         cond_embed = cond_embed[:, None, :]
 
         x = self.in_proj(x_t)
         freqs = self._rope_freqs(x.shape[1], x.device)
+        context_plan = None
+        if len(self.blocks) > 0:
+            # The concatenated context mask is identical for every block; build
+            # the attention plan once (its packing step requires a device sync)
+            # and share it across blocks and checkpoint recomputation.
+            attn0 = self.blocks[0].attention
+            context_plan = build_context_attention_plan(
+                attn0.build_context_masks(
+                    batch=x.shape[0],
+                    query_len=x.shape[1],
+                    device=x.device,
+                    self_mask=latent_mask,
+                    text_len=text_state.shape[1],
+                    text_mask=text_mask,
+                    speaker_len=(
+                        speaker_state.shape[1]
+                        if attn0.has_speaker_condition and speaker_state is not None
+                        else None
+                    ),
+                    speaker_mask=speaker_mask if attn0.has_speaker_condition else None,
+                    caption_len=(
+                        caption_state.shape[1]
+                        if attn0.has_caption_condition and caption_state is not None
+                        else None
+                    ),
+                    caption_mask=caption_mask if attn0.has_caption_condition else None,
+                ),
+                query_len=x.shape[1],
+                attention_dtype=x.dtype,
+            )
         use_checkpoint = self.gradient_checkpointing and self.training and context_kv_cache is None
+        store_every = max(0, int(self.gradient_checkpointing_store_every))
         for i, block in enumerate(self.blocks):
             context_kv = context_kv_cache[i] if context_kv_cache is not None else None
-            if use_checkpoint:
+            store_this_block = store_every > 0 and (i % store_every == store_every - 1)
+            if use_checkpoint and not store_this_block:
                 x = _torch_checkpoint(
                     block,
                     x,
@@ -1607,6 +1956,7 @@ class TextToLatentRFDiT(nn.Module):
                     freqs,
                     latent_mask,
                     use_reentrant=False,
+                    context_plan=context_plan,
                 )
             else:
                 x = block(
@@ -1621,6 +1971,7 @@ class TextToLatentRFDiT(nn.Module):
                     freqs_cis=freqs,
                     self_mask=latent_mask,
                     context_kv=context_kv,
+                    context_plan=context_plan,
                 )
 
         x = self.out_norm(x)
@@ -1645,7 +1996,20 @@ class TextToLatentRFDiT(nn.Module):
         duration_has_speaker: torch.Tensor | None = None,
         duration_has_caption: torch.Tensor | None = None,
         duration_only: bool = False,
+        duration_backprop_to_condition: bool = False,
+        delta_t: torch.Tensor | None = None,
+        encoded_conditions: tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            torch.Tensor | None,
+        ]
+        | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if duration_features is not None and encoded_conditions is not None:
+            raise ValueError("encoded_conditions is not supported by the duration path.")
         if duration_features is not None:
             (
                 text_state,
@@ -1673,6 +2037,7 @@ class TextToLatentRFDiT(nn.Module):
                     duration_features=duration_features,
                     has_speaker=duration_has_speaker,
                     has_caption=duration_has_caption,
+                    detach_condition=True,
                 )
 
             if x_t is None or t is None:
@@ -1711,6 +2076,7 @@ class TextToLatentRFDiT(nn.Module):
                 caption_state=caption_state,
                 caption_mask=caption_mask_dit,
                 latent_mask=latent_mask,
+                delta_t=delta_t,
             )
             duration_pred = self.predict_duration_log_frames(
                 text_state=text_state,
@@ -1722,6 +2088,7 @@ class TextToLatentRFDiT(nn.Module):
                 duration_features=duration_features,
                 has_speaker=duration_has_speaker,
                 has_caption=duration_has_caption,
+                detach_condition=not duration_backprop_to_condition,
             )
             return v_pred, duration_pred
 
@@ -1730,24 +2097,45 @@ class TextToLatentRFDiT(nn.Module):
         if x_t is None or t is None:
             raise ValueError("x_t and t are required for RF forward.")
 
-        (
-            text_state,
-            text_mask,
-            speaker_state,
-            speaker_mask,
-            caption_state,
-            caption_mask,
-        ) = self.encode_conditions(
-            text_input_ids=text_input_ids,
-            text_mask=text_mask,
-            ref_latent=ref_latent,
-            ref_mask=ref_mask,
-            caption_input_ids=caption_input_ids,
-            caption_mask=caption_mask,
-            text_condition_dropout=text_condition_dropout,
-            speaker_condition_dropout=speaker_condition_dropout,
-            caption_condition_dropout=caption_condition_dropout,
-        )
+        if encoded_conditions is None:
+            (
+                text_state,
+                text_mask,
+                speaker_state,
+                speaker_mask,
+                caption_state,
+                caption_mask,
+            ) = self.encode_conditions(
+                text_input_ids=text_input_ids,
+                text_mask=text_mask,
+                ref_latent=ref_latent,
+                ref_mask=ref_mask,
+                caption_input_ids=caption_input_ids,
+                caption_mask=caption_mask,
+                text_condition_dropout=text_condition_dropout,
+                speaker_condition_dropout=speaker_condition_dropout,
+                caption_condition_dropout=caption_condition_dropout,
+            )
+        else:
+            if any(
+                value is not None
+                for value in (
+                    text_condition_dropout,
+                    speaker_condition_dropout,
+                    caption_condition_dropout,
+                )
+            ):
+                raise ValueError(
+                    "Condition dropout must already be reflected in encoded_conditions."
+                )
+            (
+                text_state,
+                text_mask,
+                speaker_state,
+                speaker_mask,
+                caption_state,
+                caption_mask,
+            ) = encoded_conditions
         return self.forward_with_encoded_conditions(
             x_t=x_t,
             t=t,
@@ -1758,6 +2146,7 @@ class TextToLatentRFDiT(nn.Module):
             caption_state=caption_state,
             caption_mask=caption_mask,
             latent_mask=latent_mask,
+            delta_t=delta_t,
         )
 
     def build_context_kv_cache(
@@ -1796,6 +2185,7 @@ class TextToLatentRFDiT(nn.Module):
         caption_state: torch.Tensor | None = None,
         caption_mask: torch.Tensor | None = None,
         has_caption: torch.Tensor | None = None,
+        detach_condition: bool = True,
     ) -> torch.Tensor:
         if self.duration_predictor is None:
             raise RuntimeError("Duration predictor is disabled for this model.")
@@ -1809,14 +2199,23 @@ class TextToLatentRFDiT(nn.Module):
                 f"expected {self.cfg.duration_aux_dim}, got {duration_features.shape[1]}"
             )
 
+        duration_text_state = text_state
+        duration_speaker_state = speaker_state
+        duration_caption_state = caption_state
+        if detach_condition:
+            duration_text_state = text_state.detach()
+            if speaker_state is not None:
+                duration_speaker_state = speaker_state.detach()
+            if caption_state is not None:
+                duration_caption_state = caption_state.detach()
         pred = self.duration_predictor(
-            text_state.detach(),
+            duration_text_state,
             text_mask=text_mask,
             aux_features=duration_features,
-            speaker_state=None if speaker_state is None else speaker_state.detach(),
+            speaker_state=duration_speaker_state,
             speaker_mask=speaker_mask,
             has_speaker=has_speaker,
-            caption_state=None if caption_state is None else caption_state.detach(),
+            caption_state=duration_caption_state,
             caption_mask=caption_mask,
             has_caption=has_caption,
         )
