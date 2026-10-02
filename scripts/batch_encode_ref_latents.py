@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
 指定フォルダ内の mp3 / wav を一括で ref-latent (.pt) に変換するバッチスクリプト。
-内部の変換処理は encode_ref_latent.py (同じ scripts/ 配下) と同じロジックを使う。
+内部の変換処理は encode_ref_latent.py (同じ scripts/ 配下) の encode_reference() を使う。
 
 使い方:
-    uv run python scripts/batch_encode_ref_latents.py <入力フォルダ>
+    uv run --no-sync python scripts/batch_encode_ref_latents.py <入力フォルダ>
 
     出力フォルダは省略可能。省略した場合は <入力フォルダ>/latents に自動作成される。
 
 例:
-    uv run python scripts/batch_encode_ref_latents.py /path/to/ref_voices
+    uv run --no-sync python scripts/batch_encode_ref_latents.py /path/to/ref_voices
 
     sample.mp3  -> /path/to/ref_voices/latents/sample.pt
     voice_a.wav -> /path/to/ref_voices/latents/voice_a.pt
 
     出力先を明示的に変えたい場合は --output-dir で指定できる:
-    uv run python scripts/batch_encode_ref_latents.py \\
+    uv run --no-sync python scripts/batch_encode_ref_latents.py \\
         /path/to/ref_voices \\
         --output-dir /path/to/ref_latents
 
@@ -41,8 +41,9 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 import torch
 
+from encode_ref_latent import add_encode_options, encode_reference
 from irodori_tts.codec import DACVAECodec
-from encode_ref_latent import detect_device
+from irodori_tts.inference_runtime import default_runtime_device
 
 AUDIO_EXTENSIONS = {".mp3", ".wav"}
 
@@ -70,22 +71,7 @@ def main() -> None:
         help=".pt ファイルの出力先フォルダ（存在しなければ自動作成）。"
         "省略した場合は <入力フォルダ>/latents になる。",
     )
-    parser.add_argument(
-        "--codec-repo",
-        default="Aratako/Semantic-DACVAE-Japanese-32dim",
-        help="DACVAE コーデックの HuggingFace repo id。通常は変更不要。",
-    )
-    parser.add_argument(
-        "--device",
-        default=None,
-        help="cuda / mps / cpu を明示的に指定したい場合。未指定なら自動判定。",
-    )
-    parser.add_argument(
-        "--normalize-db",
-        type=float,
-        default=-16.0,
-        help="ラウドネス正規化のターゲット値。infer.py の --ref-normalize-db デフォルトと揃えてあります。",
-    )
+    add_encode_options(parser)
     parser.add_argument(
         "--overwrite",
         action="store_true",
@@ -110,7 +96,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"[batch_encode] 出力先: {output_dir}")
 
-    device = args.device or detect_device()
+    device = args.device or default_runtime_device()
     print(f"[batch_encode] device: {device}")
     print(f"[batch_encode] codec_repo: {args.codec_repo}")
 
@@ -136,7 +122,14 @@ def main() -> None:
         print(f"[{i}/{len(audio_files)}] encoding: {audio_path.name}")
         start = time.time()
         try:
-            latent = codec.encode_file(str(audio_path))
+            latent = encode_reference(
+                codec,
+                audio_path,
+                normalize_db=args.normalize_db,
+                ensure_max=args.ensure_max,
+                max_ref_seconds=args.max_ref_seconds,
+                log=lambda msg: print(f"    {msg}"),
+            )
             torch.save(latent, output_path)
         except Exception as e:  # noqa: BLE001 - バッチ処理なので1件失敗しても続行する
             print(f"    -> failed: {e}")
