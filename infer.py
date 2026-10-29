@@ -231,6 +231,15 @@ def main() -> None:
         default=False,
         help="Use dynamic=True for torch.compile (default: disabled).",
     )
+    parser.add_argument(
+        "--split-rare-tokens",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Encode without rare long tokens of the v4 Small text tokenizer, which the model "
+            "often misreads (default: enabled; other tokenizers are unaffected)."
+        ),
+    )
     parser.add_argument("--cfg-scale-text", type=float, default=3.0)
     parser.add_argument("--cfg-scale-caption", type=float, default=3.0)
     parser.add_argument("--cfg-scale-speaker", type=float, default=5.0)
@@ -411,6 +420,7 @@ def main() -> None:
             codec_deterministic_decode=bool(args.codec_deterministic_decode),
             compile_model=bool(args.compile_model),
             compile_dynamic=bool(args.compile_dynamic),
+            split_rare_tokens=bool(args.split_rare_tokens),
         )
     )
     if runtime.model_cfg.use_speaker_condition_resolved and not (

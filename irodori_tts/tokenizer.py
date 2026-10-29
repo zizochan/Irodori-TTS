@@ -27,6 +27,13 @@ class PretrainedTextTokenizer:
 
         if self.add_bos and self.tokenizer.bos_token_id is None:
             raise ValueError("Tokenizer has no bos_token_id but add_bos=True.")
+        self.rare_token_splitter = None
+
+    def enable_rare_token_split(self) -> None:
+        """Encode without rare long tokens (inference only; see token_split.py)."""
+        from .token_split import RareTokenSplitter
+
+        self.rare_token_splitter = RareTokenSplitter(self.tokenizer.backend_tokenizer)
 
     @classmethod
     def from_pretrained(
@@ -69,7 +76,10 @@ class PretrainedTextTokenizer:
         return int(pad_id)
 
     def encode(self, text: str, add_bos: bool | None = None) -> torch.Tensor:
-        token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        if self.rare_token_splitter is not None:
+            token_ids = self.rare_token_splitter.encode(text)
+        else:
+            token_ids = self.tokenizer.encode(text, add_special_tokens=False)
         use_bos = self.add_bos if add_bos is None else bool(add_bos)
         if use_bos:
             bos_id = self.bos_token_id
@@ -108,17 +118,27 @@ class PretrainedTextTokenizer:
         else:
             body_max_length = max_length
 
-        encoded_batch = self.tokenizer(
-            texts,
-            add_special_tokens=False,
-            padding="max_length",
-            truncation=True,
-            max_length=body_max_length,
-            return_tensors="pt",
-            return_attention_mask=True,
-        )
-        body_ids = encoded_batch["input_ids"].to(dtype=torch.long)
-        body_mask = encoded_batch["attention_mask"].to(dtype=torch.bool)
+        if self.rare_token_splitter is not None:
+            body_ids = torch.full(
+                (len(texts), body_max_length), self.pad_token_id, dtype=torch.long
+            )
+            body_mask = torch.zeros((len(texts), body_max_length), dtype=torch.bool)
+            for row, text in enumerate(texts):
+                ids = self.rare_token_splitter.encode(text)[:body_max_length]
+                body_ids[row, : len(ids)] = torch.tensor(ids, dtype=torch.long)
+                body_mask[row, : len(ids)] = True
+        else:
+            encoded_batch = self.tokenizer(
+                texts,
+                add_special_tokens=False,
+                padding="max_length",
+                truncation=True,
+                max_length=body_max_length,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            body_ids = encoded_batch["input_ids"].to(dtype=torch.long)
+            body_mask = encoded_batch["attention_mask"].to(dtype=torch.bool)
 
         if not self.add_bos:
             return body_ids, body_mask
